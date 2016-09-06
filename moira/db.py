@@ -11,6 +11,7 @@ from twisted.internet import defer, task, reactor
 from moira import config
 from moira.cache import cache
 from moira import logs
+from moira.tools.search import get_tokens_for_text, get_tokens_for_pattern
 from moira.trigger import trigger_reformat
 
 _doc_string = """
@@ -41,6 +42,10 @@ Redis database objects:
     - SORTED SET {23}
     - SET {24}
     - KEY {25}
+    - SET {26}
+    - SET {27}
+    - SET {28}
+    - SET {29}
 """
 
 __docformat__ = 'reStructuredText'
@@ -75,6 +80,10 @@ TAG_PREFIX = "moira-tag:{0}"
 TRIGGER_CHECK_LOCK_PREFIX = "moira-metric-check-lock:{0}"
 TRIGGER_IN_BAD_STATE = "moira-bad-state-triggers"
 CHECKS_COUNTER = "moira-selfstate:checks-counter"
+SEARCH_WORD_PREFIX = "moira-search-word:{0}"
+SEARCH_WORD_PATTERN_PREFIX = "moira-search-word-pattern:{0}"
+TRIGGER_SWORD_PREFIX = "moira-trigger-swords:{0}"
+TRIGGER_SWORD_PATTERN_PREFIX = "moira-trigger-swords-pattern:{0}"
 
 TRIGGER_EVENTS_TTL = 3600 * 24 * 30
 
@@ -102,10 +111,14 @@ current_module.__doc__ = _doc_string.format(
     TRIGGER_EVENTS.format("<trigger_id>"),
     TRIGGER_THROTTLING_BEGINNING_PREFIX.format("<trigger_id>"),
     TAG_PREFIX.format("<tag>"),
-    TRIGGER_CHECK_LOCK_PREFIX.format("trigger_id"),
+    TRIGGER_CHECK_LOCK_PREFIX.format("<trigger_id>"),
     TRIGGERS_CHECKS,
     TRIGGER_IN_BAD_STATE,
-    CHECKS_COUNTER
+    CHECKS_COUNTER,
+    SEARCH_WORD_PREFIX.format("<word>"),
+    SEARCH_WORD_PATTERN_PREFIX.format("<word>"),
+    TRIGGER_SWORD_PREFIX.format("<trigger_id>"),
+    TRIGGER_SWORD_PATTERN_PREFIX.format("<trigger_id>")
 )
 
 
@@ -421,35 +434,113 @@ class Db(service.Service):
         if ttl is not None:
             trigger["ttl"] = str(ttl)
         tags = trigger.get("tags", [])
-        t = yield self.rc.multi()
         patterns = trigger.get("patterns", [])
+
+        t = yield self.rc.multi()
+
         cleanup_patterns = []
         if existing is not None:
-            for pattern in [
-                item for item in existing.get(
-                    "patterns",
-                    []) if item not in patterns]:
-                yield t.srem(PATTERN_TRIGGERS_PREFIX.format(pattern), trigger_id)
-                cleanup_patterns.append(pattern)
-            for tag in [
-                item for item in existing.get(
-                    "tags",
-                    []) if item not in tags]:
-                yield self.removeTriggerTag(trigger_id, tag, t)
+            # clean old patterns
+            old_patterns = existing.get("patterns", [])
+            for old_pattern in set(old_patterns) - set(patterns):
+                yield t.srem(PATTERN_TRIGGERS_PREFIX.format(old_pattern), trigger_id)
+                cleanup_patterns.append(old_pattern)
+
+            # clean old tags
+            old_tags = existing.get("tags", [])
+            for old_tag in set(old_tags) - set(tags):
+                yield self.removeTriggerTag(trigger_id, old_tag, t)
+
         yield t.set(TRIGGER_PREFIX.format(trigger_id), anyjson.serialize(trigger))
         yield t.sadd(TRIGGERS, trigger_id)
+
         for pattern in patterns:
             yield t.sadd(PATTERNS, pattern)
             yield t.sadd(PATTERN_TRIGGERS_PREFIX.format(pattern), trigger_id)
+
         for tag in tags:
             yield self.addTriggerTag(trigger_id, tag, t)
+
+        yield self.addTriggerToSearchIndex(trigger_id, trigger, existing)
+
         yield t.commit()
+
         for pattern in cleanup_patterns:
             triggers = yield self.getPatternTriggers(pattern)
             if not triggers:
                 yield self.removePatternTriggers(pattern)
                 yield self.removePattern(pattern)
                 yield self.delPatternMetrics(pattern)
+
+    @defer.inlineCallbacks
+    @docstring_parameters(
+        TRIGGER_SWORD_PREFIX.format("<trigger_id>"),
+        TRIGGER_SWORD_PATTERN_PREFIX.format("<trigger_id>"),
+        SEARCH_WORD_PREFIX.format("<word>"),
+        SEARCH_WORD_PATTERN_PREFIX.format("<word>"))
+    def addTriggerToSearchIndex(self, trigger_id, trigger, existing=None):
+        """
+        addTriggerToSearchIndex(self, trigger_id, trigger)
+
+        Creates tokens for trigger:
+            - Update search words set {0}
+            - Update search patterns set {1}
+            - Add *trigger_id* to search words set {2}
+            - Add *trigger_id* to search patterns set {3}
+
+        :param trigger: trigger json object
+        :type trigger: dict
+        :param trigger_id: trigger identity
+        :type trigger_id: string
+        """
+
+        tags = trigger.get("tags", [])
+        patterns = trigger.get("patterns", [])
+        title = trigger.get("name", u"")
+
+        text_tokens = get_tokens_for_text(title)
+        pattern_tokens = []
+        for p in patterns:
+            pattern_tokens.extend(get_tokens_for_pattern(p))
+
+        pipeline = yield self.rc.pipeline()
+
+        @defer.inlineCallbacks
+        def remove_old_words_from_trigger(new_words, prefix):
+            old_words = yield self.rc.smembers(prefix.format(trigger_id))
+            old_words = [unicode(e) if isinstance(e, int) else e for e in old_words]
+
+            words_for_check = set(old_words) - set(new_words)
+            for word in words_for_check:
+                yield self.rc.srem(prefix.format(trigger_id), word)
+
+            defer.returnValue(words_for_check)
+
+        def link_word_to_trigger(words, words_set_prefix, triggers_set_prefix):
+            for word in words:
+                pipeline.sadd(triggers_set_prefix.format(trigger_id), word)
+                pipeline.sadd(words_set_prefix.format(word), trigger_id)
+
+        @defer.inlineCallbacks
+        def clean_words_without_triggers(words, prefix):
+            for word in words:
+                word_with_prefix = prefix.format(word)
+                have_triggers = (yield self.rc.scard(word_with_prefix)) == 0
+                if not have_triggers:
+                    yield self.rc.delete(word_with_prefix)
+
+        cleanup_words, cleanup_patterns = [], []
+        if existing is not None:
+            cleanup_words = yield remove_old_words_from_trigger(text_tokens, TRIGGER_SWORD_PREFIX)
+            cleanup_patterns = yield remove_old_words_from_trigger(pattern_tokens, TRIGGER_SWORD_PATTERN_PREFIX)
+
+        link_word_to_trigger(text_tokens, SEARCH_WORD_PREFIX, TRIGGER_SWORD_PREFIX)
+        link_word_to_trigger(pattern_tokens, SEARCH_WORD_PATTERN_PREFIX, TRIGGER_SWORD_PATTERN_PREFIX)
+
+        yield pipeline.execute_pipeline()
+
+        yield clean_words_without_triggers(cleanup_words, SEARCH_WORD_PREFIX)
+        yield clean_words_without_triggers(cleanup_patterns, SEARCH_WORD_PATTERN_PREFIX)
 
     @defer.inlineCallbacks
     @docstring_parameters(PATTERNS)
@@ -520,6 +611,7 @@ class Db(service.Service):
     @defer.inlineCallbacks
     def _getTriggersChecks(self, triggers_ids):
         triggers = []
+
         pipeline = yield self.rc.pipeline()
         for trigger_id in triggers_ids:
             pipeline.get(TRIGGER_PREFIX.format(trigger_id))
@@ -527,6 +619,7 @@ class Db(service.Service):
             pipeline.get(LAST_CHECK_PREFIX.format(trigger_id))
             pipeline.get(TRIGGER_NEXT_PREFIX.format(trigger_id))
         results = yield pipeline.execute_pipeline()
+
         slices = [[triggers_ids[i / 4]] + results[i:i + 4] for i in range(0, len(results), 4)]
         for trigger_id, trigger_json, trigger_tags, last_check, throttling in slices:
             if trigger_json is None:
@@ -536,6 +629,7 @@ class Db(service.Service):
             trigger["last_check"] = None if last_check is None else anyjson.deserialize(last_check)
             trigger["throttling"] = long(throttling) if throttling and time.time() < long(throttling) else 0
             triggers.append(trigger)
+
         defer.returnValue(triggers)
 
     @defer.inlineCallbacks
@@ -574,9 +668,9 @@ class Db(service.Service):
 
     @defer.inlineCallbacks
     @docstring_parameters(TRIGGERS_CHECKS)
-    def getFilteredTriggersChecksPage(self, page, size, filter_ok, filter_tags):
+    def getFilteredTriggersChecksPage(self, page, size, filter_ok, filter_tags=None, filter_words=None):
         """
-        getFilteredTriggersChecksPage(self, page, size, filter_ok, filter_tags)
+        getFilteredTriggersChecksPage(self, page, size, filter_ok)
 
         - Returns filtered triggers page
 
@@ -588,28 +682,46 @@ class Db(service.Service):
         :type filter_ok: boolean
         :param filter_tags: use tag triggers set
         :type filter_tags: list of strings
+        :param filter_words: use words triggers set
+        :type filter_words: list of tuples:  [('w_text', 'w_pattern'), ...]
         :rtype: json
         """
-        filter_sets = map(lambda tag: TAG_TRIGGERS_PREFIX.format(tag), filter_tags)
+        filter_tags = map(TAG_TRIGGERS_PREFIX.format, filter_tags or [])
         if filter_ok:
-            filter_sets.append(TRIGGER_IN_BAD_STATE)
+            filter_tags.append(TRIGGER_IN_BAD_STATE)
+
+        filter_words_keys = []
+        for t_token, p_token in filter_words:
+            t_token_key = SEARCH_WORD_PREFIX.format(t_token[0]) if t_token else None
+            p_token_key = SEARCH_WORD_PATTERN_PREFIX.format(p_token[0]) if p_token else None
+            filter_words_keys.append((t_token_key, p_token_key))
+
+        tmp_union_keys = []
+        def generate_tmp_key():
+            k = "moira-set-union-tmp-key:{}".format(str(uuid4()))
+            tmp_union_keys.append(k)
+            return k
+
         pipeline = yield self.rc.pipeline()
         pipeline.zrevrange(TRIGGERS_CHECKS, start=0, end=-1)
-        for s in filter_sets:
-            pipeline.smembers(s)
-        triggers_lists = yield pipeline.execute_pipeline()
-        total = []
-        for id in triggers_lists[0]:
-            valid = True
-            for s in triggers_lists[1:]:
-                if id not in s:
-                    valid = False
-                    break
-            if valid:
-                total.append(id)
 
+        for text_key, pattern_key in filter_words_keys:
+            tmp_key = generate_tmp_key()
+            pipeline.sunionstore(tmp_key, [text_key, pattern_key])
+
+        filter_tags.extend(tmp_union_keys)
+        pipeline.sinter(filter_tags)
+        pipeline_result = yield pipeline.execute_pipeline()
+
+        triggers_lists, filtered_trigger_set = pipeline_result[0], pipeline_result[-1]
+
+        if tmp_union_keys:
+            yield self.rc.delete(tmp_union_keys)
+
+        total = filter(lambda t_id: t_id in filtered_trigger_set, triggers_lists)
         filtered_ids = total[page * size: (page + 1) * size]
         triggers = yield self._getTriggersChecks(filtered_ids)
+
         defer.returnValue((triggers, len(total)))
 
     @defer.inlineCallbacks
@@ -833,29 +945,66 @@ class Db(service.Service):
     @audit
     @defer.inlineCallbacks
     @docstring_parameters(TRIGGER_PREFIX.format("<trigger_id>"),
-                          TRIGGERS, PATTERN_TRIGGERS_PREFIX.format("<pattern>"))
+                          TRIGGER_TAGS_PREFIX.format("<trigger_id>"),
+                          TRIGGERS,
+                          TRIGGER_SWORD_PREFIX.format("<trigger_id>"),
+                          TRIGGER_SWORD_PATTERN_PREFIX.format("<trigger_id>"),
+                          TAG_TRIGGERS_PREFIX.format("<tag>"),
+                          PATTERN_TRIGGERS_PREFIX.format("<pattern>"),
+                          SEARCH_WORD_PREFIX.format("<word>"),
+                          SEARCH_WORD_PATTERN_PREFIX.format("<word>"))
     def removeTrigger(self, trigger_id, existing=None):
         """
         removeTrigger(self, trigger_id)
 
         Creates redis transaction for:
             - Delete key {0}
-            - Remove *trigger_id* from set {1}
+            - Delete key {1}
             - Remove *trigger_id* from set {2}
+            - Delete key {3}
+            - Delete key {4}
+            - Remove *trigger_id* from set {5}
+            - Remove *trigger_id* from set {6}
+            - Remove *trigger_id* from set {7}
+            - Remove *trigger_id* from set {8}
 
         :param trigger_id: trigger identity
         :type trigger_id: string
         """
         if existing is not None:
             t = yield self.rc.multi()
+
             yield t.delete(TRIGGER_PREFIX.format(trigger_id))
             yield t.delete(TRIGGER_TAGS_PREFIX.format(trigger_id))
             yield t.srem(TRIGGERS, trigger_id)
+
+            search_words = yield self.rc.smembers(TRIGGER_SWORD_PREFIX.format(trigger_id))
+            pattern_words = yield self.rc.smembers(TRIGGER_SWORD_PATTERN_PREFIX.format(trigger_id))
+
+            yield t.delete(TRIGGER_SWORD_PREFIX.format(trigger_id))
+            yield t.delete(TRIGGER_SWORD_PATTERN_PREFIX.format(trigger_id))
+
             for tag in existing.get("tags", []):
                 yield t.srem(TAG_TRIGGERS_PREFIX.format(tag), trigger_id)
             for pattern in existing.get("patterns", []):
                 yield t.srem(PATTERN_TRIGGERS_PREFIX.format(pattern), trigger_id)
+
+            for word in search_words:
+                word_with_prefix = SEARCH_WORD_PREFIX.format(word)
+                yield t.srem(word_with_prefix, trigger_id)
+                have_triggers = (yield t.scard(word_with_prefix)) == 0
+                if not have_triggers:
+                    yield t.delete(word_with_prefix)
+
+            for word in pattern_words:
+                word_with_prefix = SEARCH_WORD_PATTERN_PREFIX.format(word)
+                yield t.srem(word_with_prefix, trigger_id)
+                have_triggers = (yield t.scard(word_with_prefix)) == 0
+                if not have_triggers:
+                    yield t.delete(word_with_prefix)
+
             yield t.commit()
+
             for pattern in existing.get("patterns", []):
                 count = yield self.rc.scard(PATTERN_TRIGGERS_PREFIX.format(pattern))
                 if count == 0:

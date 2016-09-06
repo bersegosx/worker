@@ -8,3 +8,4 @@ ujson
 pyyaml
 fakeredis
 flake8
+Whoosh==2.7.4

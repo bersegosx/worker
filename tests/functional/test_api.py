@@ -1,3 +1,5 @@
+from urllib import quote
+
 import anyjson
 from . import trigger, WorkerTests, BodyReceiver
 from twisted.internet.defer import inlineCallbacks, returnValue
@@ -144,22 +146,21 @@ class ApiTests(WorkerTests):
         self.assertEqual(10, triggers["size"])
         self.assertEqual(1, triggers["total"])
 
-        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10',
-                                                add_headers={'Cookie': ['moira_filter_tags=tag1; \
-                                                moira_filter_ok=true']})
+        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10&q={}'.format(quote('#tag1')),
+                                                add_headers={'Cookie': ['moira_filter_ok=true']})
         self.assertEqual(1, len(triggers["list"]))
         self.assertEqual(1, triggers["total"])
 
-        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10',
-                                                add_headers={'Cookie': ['moira_filter_tags=']})
+        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10&q=')
         self.assertEqual(1, len(triggers["list"]))
         self.assertEqual(1, triggers["total"])
 
-        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10',
-                                                add_headers={'Cookie': ['moira_filter_tags=not-exising; \
-                                                moira_filter_ok=true']})
+        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10&q={}'.format(quote('#not-exising')),
+                                                add_headers={'Cookie': ['moira_filter_ok=true']})
         self.assertEqual(0, len(triggers["list"]))
         self.assertEqual(0, triggers["total"])
+
+        _response, _body = yield self.request('GET', 'trigger/page?p=error&size=ops')
 
     @trigger("expression-trigger")
     @inlineCallbacks
@@ -384,3 +385,70 @@ class ApiTests(WorkerTests):
     def testUserLogin(self):
         response, user = yield self.request('GET', 'user')
         self.assertEqual('tester', user["login"])
+
+    @trigger("test-trigger-id")
+    @inlineCallbacks
+    def testSearchWords(self):
+        _r, _body = yield self.request('PUT', 'trigger/{0}'.format(self.trigger.id), anyjson.serialize({
+            "name": "The testo trigger message",
+            "targets": [
+                'alias(ops.gops.testo.12, "Voo")',
+                'sum(Ops.regis.threads.server*)'
+            ],
+            "warn_value": 0, "error_value": 1,
+            "tags": ["tag1", "desk"]
+        }))
+
+        _r, _body = yield self.request('PUT', 'trigger/{0}-2'.format(self.trigger.id), anyjson.serialize({
+            "name": "Helpdesk count",
+            "targets": ['sum(helpdesk.messages)'],
+            "warn_value": 0, "error_value": 1,
+            "tags": ["desk"]
+        }))
+
+        @inlineCallbacks
+        def make_search_request(query):
+            _r, json = yield self.request('GET', 'trigger/page?p=0&size=10&q={}'.format(quote(query)))
+            returnValue(json)
+
+        def assertHasResult(json, total=1):
+            self.assertEqual(total, len(json["list"]))
+            self.assertEqual(0, json["page"])
+            self.assertEqual(10, json["size"])
+            self.assertEqual(total, json["total"])
+
+        def assertHasNoResult(json):
+            self.assertEqual(0, len(json["list"]))
+            self.assertEqual(0, json["page"])
+            self.assertEqual(10, json["size"])
+            self.assertEqual(0, json["total"])
+
+        # empty query
+        json = yield make_search_request("")
+        assertHasResult(json, total=2)
+
+        # missing word
+        json = yield make_search_request("unknown")
+        assertHasNoResult(json)
+
+        # word in trigger name
+        json = yield make_search_request("testo")
+        assertHasResult(json)
+
+        # word in metric
+        json = yield make_search_request("gops")
+        assertHasResult(json)
+
+        # 'and' logic: missing word + existed
+        json = yield make_search_request("unknown gops")
+        assertHasNoResult(json)
+
+        # 'and' logic: 2 existed words
+        json = yield make_search_request("testo gops")
+        assertHasResult(json)
+
+        json = yield make_search_request("messages #desk")
+        assertHasResult(json, total=2)
+
+        json = yield make_search_request("messages #desk trigger")
+        assertHasResult(json)

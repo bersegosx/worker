@@ -7,6 +7,7 @@ from twisted.web import http
 from moira.api.request import delayed, check_json
 from moira.api.resources.metric import Metrics
 from moira.api.resources.redis import RedisResouce
+from moira.tools.search import split_search_query
 
 
 class State(RedisResouce):
@@ -125,15 +126,26 @@ class Page(RedisResouce):
     @defer.inlineCallbacks
     def render_GET(self, request):
         filter_ok = request.getCookie('moira_filter_ok')
-        filter_tags = request.getCookie('moira_filter_tags')
         page = request.args.get("p")
         size = request.args.get("size")
-        page = 0 if page is None else int(page[0])
-        size = 10 if size is None else int(size[0])
+        query_string = request.args.get("q")
+
+        try:
+            page = int(page[0])
+        except ValueError:
+            page = 0
+
+        try:
+            size = int(size[0])
+        except ValueError:
+            size = 10
+
         filter_ok = False if filter_ok is None else filter_ok == 'true'
-        filter_tags = [] if not filter_tags else unquote(filter_tags).split(',')
-        if not filter_ok and len(filter_tags) == 0:
-            triggers, total = yield self.db.getTriggersChecksPage(page * size, size - 1)
+        query_string = "" if not query_string else unquote(query_string[0])
+        filter_tags, filter_words = split_search_query(query_string)
+
+        if any([filter_ok, filter_tags, filter_words]):
+            triggers, total = yield self.db.getFilteredTriggersChecksPage(page, size, filter_ok, filter_tags, filter_words)
         else:
-            triggers, total = yield self.db.getFilteredTriggersChecksPage(page, size, filter_ok, filter_tags)
+            triggers, total = yield self.db.getTriggersChecksPage(page * size, size - 1)
         self.write_json(request, {"list": triggers, "page": page, "size": size, "total": total})
