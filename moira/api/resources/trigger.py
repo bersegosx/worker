@@ -4,6 +4,7 @@ from urllib import unquote
 from twisted.internet import defer
 from twisted.web import http
 
+from moira import config
 from moira.api.request import delayed, check_json
 from moira.api.resources.metric import Metrics
 from moira.api.resources.redis import RedisResouce
@@ -125,10 +126,10 @@ class Page(RedisResouce):
     @delayed
     @defer.inlineCallbacks
     def render_GET(self, request):
-        filter_ok = request.getCookie('moira_filter_ok')
+        filter_ok = request.getCookie(config.COOKIE_FILTER_STATE_NAME)
+        query_string = request.getCookie(config.COOKIE_SEARCH_STRING_NAME)
         page = request.args.get("p")
         size = request.args.get("size")
-        query_string = request.args.get("q")
 
         try:
             page = int(page[0])
@@ -141,7 +142,7 @@ class Page(RedisResouce):
             size = 10
 
         filter_ok = False if filter_ok is None else filter_ok == 'true'
-        query_string = "" if not query_string else unquote(query_string[0])
+        query_string = "" if not query_string else unquote(query_string)
         filter_tags, filter_words = split_search_query(query_string)
 
         if any([filter_ok, filter_tags, filter_words]):

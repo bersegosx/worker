@@ -696,27 +696,18 @@ class Db(service.Service):
             p_token_key = SEARCH_WORD_PATTERN_PREFIX.format(p_token[0]) if p_token else None
             filter_words_keys.append((t_token_key, p_token_key))
 
-        tmp_union_keys = []
-        def generate_tmp_key():
-            k = "moira-set-union-tmp-key:{}".format(str(uuid4()))
-            tmp_union_keys.append(k)
-            return k
-
         pipeline = yield self.rc.pipeline()
+
         pipeline.zrevrange(TRIGGERS_CHECKS, start=0, end=-1)
-
+        for k in filter_tags:
+            pipeline.smembers(k)
         for text_key, pattern_key in filter_words_keys:
-            tmp_key = generate_tmp_key()
-            pipeline.sunionstore(tmp_key, [text_key, pattern_key])
+            pipeline.sunion([text_key, pattern_key])
 
-        filter_tags.extend(tmp_union_keys)
-        pipeline.sinter(filter_tags)
         pipeline_result = yield pipeline.execute_pipeline()
 
-        triggers_lists, filtered_trigger_set = pipeline_result[0], pipeline_result[-1]
-
-        if tmp_union_keys:
-            yield self.rc.delete(tmp_union_keys)
+        triggers_lists, sets_result = pipeline_result[0], pipeline_result[1:]
+        filtered_trigger_set = reduce(lambda acc, x: acc & x, sets_result)
 
         total = filter(lambda t_id: t_id in filtered_trigger_set, triggers_lists)
         filtered_ids = total[page * size: (page + 1) * size]

@@ -43,6 +43,8 @@ PREFIX = "/api"
 HOSTNAME = socket.gethostname().split('.')[0]
 BAD_STATES_REMINDER = {'ERROR': 86400, 'NODATA': 86400}
 ARGS = None
+COOKIE_FILTER_STATE_NAME = 'moira_filter_ok'
+COOKIE_SEARCH_STRING_NAME = 'moira_search_string'
 
 
 def get_parser():

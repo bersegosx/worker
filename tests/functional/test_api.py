@@ -6,10 +6,16 @@ from twisted.internet.defer import inlineCallbacks, returnValue
 from twisted.web import http, client
 from twisted.web.http_headers import Headers
 from StringIO import StringIO
+from moira import config
 from moira.checker import state
 
 
 class ApiTests(WorkerTests):
+
+    @staticmethod
+    def create_cookie_header(d):
+        value = ";".join("{}={}".format(k,v) for k, v in d.iteritems())
+        return {'Cookie': [value]}
 
     @inlineCallbacks
     def request(self, method, url, content=None, state=http.OK, add_headers=None):
@@ -146,17 +152,25 @@ class ApiTests(WorkerTests):
         self.assertEqual(10, triggers["size"])
         self.assertEqual(1, triggers["total"])
 
-        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10&q={}'.format(quote('#tag1')),
-                                                add_headers={'Cookie': ['moira_filter_ok=true']})
+        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10', add_headers=
+            self.create_cookie_header({
+                config.COOKIE_FILTER_STATE_NAME: 'true',
+                config.COOKIE_SEARCH_STRING_NAME: quote('#tag1')
+            })
+        )
         self.assertEqual(1, len(triggers["list"]))
         self.assertEqual(1, triggers["total"])
 
-        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10&q=')
+        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10')
         self.assertEqual(1, len(triggers["list"]))
         self.assertEqual(1, triggers["total"])
 
-        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10&q={}'.format(quote('#not-exising')),
-                                                add_headers={'Cookie': ['moira_filter_ok=true']})
+        response, triggers = yield self.request('GET', 'trigger/page?p=0&size=10', add_headers=
+            self.create_cookie_header({
+                config.COOKIE_FILTER_STATE_NAME: 'true',
+                config.COOKIE_SEARCH_STRING_NAME: quote('#not-exising')
+            })
+        )
         self.assertEqual(0, len(triggers["list"]))
         self.assertEqual(0, triggers["total"])
 
@@ -408,7 +422,8 @@ class ApiTests(WorkerTests):
 
         @inlineCallbacks
         def make_search_request(query):
-            _r, json = yield self.request('GET', 'trigger/page?p=0&size=10&q={}'.format(quote(query)))
+            headers = self.create_cookie_header({config.COOKIE_SEARCH_STRING_NAME: quote(query)})
+            _r, json = yield self.request('GET', 'trigger/page?p=0&size=10', add_headers=headers)
             returnValue(json)
 
         def assertHasResult(json, total=1):
@@ -447,8 +462,12 @@ class ApiTests(WorkerTests):
         json = yield make_search_request("testo gops")
         assertHasResult(json)
 
-        json = yield make_search_request("messages #desk")
+        # prefix
+        json = yield make_search_request("mess #desk")
         assertHasResult(json, total=2)
 
+        json = yield make_search_request("messages #desk")
+        assertHasResult(json, total=1)
+
         json = yield make_search_request("messages #desk trigger")
-        assertHasResult(json)
+        assertHasNoResult(json)
