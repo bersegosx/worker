@@ -471,3 +471,32 @@ class ApiTests(WorkerTests):
 
         json = yield make_search_request("messages #desk trigger")
         assertHasNoResult(json)
+
+        # update trigger:
+        #   - name: "testo" => "tes"
+        #   - metric: "gops" => "go"
+        _r, _body = yield self.request('PUT', 'trigger/{0}'.format(self.trigger.id), anyjson.serialize({
+            "name": "The tes trigger message",
+            "targets": [
+                'alias(ops.go.12, "Voo")',
+                'sum(Ops.regis.threads.server*)'
+            ],
+            "warn_value": 0, "error_value": 1,
+            "tags": ["tag1", "desk"]
+        }))
+
+        json = yield make_search_request("te")
+        assertHasResult(json)
+        json = yield make_search_request("tes")
+        assertHasResult(json)
+        json = yield make_search_request("testo")
+        assertHasNoResult(json)
+
+        json = yield make_search_request("g")
+        assertHasResult(json)
+        json = yield make_search_request("go")
+        assertHasResult(json)
+        json = yield make_search_request("gop")
+        assertHasNoResult(json)
+        json = yield make_search_request("gops")
+        assertHasNoResult(json)

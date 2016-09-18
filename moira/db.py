@@ -461,7 +461,7 @@ class Db(service.Service):
         for tag in tags:
             yield self.addTriggerTag(trigger_id, tag, t)
 
-        yield self.addTriggerToSearchIndex(trigger_id, trigger, existing)
+        yield self.addTriggerToSearchIndex(trigger_id, trigger, t, existing)
 
         yield t.commit()
 
@@ -478,9 +478,9 @@ class Db(service.Service):
         TRIGGER_SWORD_PATTERN_PREFIX.format("<trigger_id>"),
         SEARCH_WORD_PREFIX.format("<word>"),
         SEARCH_WORD_PATTERN_PREFIX.format("<word>"))
-    def addTriggerToSearchIndex(self, trigger_id, trigger, existing=None):
+    def addTriggerToSearchIndex(self, trigger_id, trigger, t, existing=None):
         """
-        addTriggerToSearchIndex(self, trigger_id, trigger)
+        addTriggerToSearchIndex(self, trigger_id, trigger, t)
 
         Creates tokens for trigger:
             - Update search words set {0}
@@ -492,34 +492,25 @@ class Db(service.Service):
         :type trigger: dict
         :param trigger_id: trigger identity
         :type trigger_id: string
+        :param t: redis transaction
+        :type t: redis transaction object
         """
 
-        tags = trigger.get("tags", [])
-        patterns = trigger.get("patterns", [])
-        title = trigger.get("name", u"")
+        def get_tokens_for_trigger(trigger):
+            trigger_name     = trigger.get("name", u"")
+            trigger_patterns = trigger.get("patterns", [])
 
-        text_tokens = get_tokens_for_text(title)
-        pattern_tokens = []
-        for p in patterns:
-            pattern_tokens.extend(get_tokens_for_pattern(p))
+            text_tokens = get_tokens_for_text(trigger_name)
+            pattern_tokens = []
+            for p in trigger_patterns:
+                pattern_tokens.extend(get_tokens_for_pattern(p))
 
-        pipeline = yield self.rc.pipeline()
+            return text_tokens, pattern_tokens
 
         @defer.inlineCallbacks
-        def remove_old_words_from_trigger(new_words, prefix):
-            old_words = yield self.rc.smembers(prefix.format(trigger_id))
-            old_words = [unicode(e) if isinstance(e, int) else e for e in old_words]
-
-            words_for_check = set(old_words) - set(new_words)
-            for word in words_for_check:
-                yield self.rc.srem(prefix.format(trigger_id), word)
-
-            defer.returnValue(words_for_check)
-
-        def link_word_to_trigger(words, words_set_prefix, triggers_set_prefix):
+        def remove_old_words_from_trigger(words, prefix):
             for word in words:
-                pipeline.sadd(triggers_set_prefix.format(trigger_id), word)
-                pipeline.sadd(words_set_prefix.format(word), trigger_id)
+                yield t.srem(prefix.format(trigger_id), word)
 
         @defer.inlineCallbacks
         def clean_words_without_triggers(words, prefix):
@@ -529,18 +520,27 @@ class Db(service.Service):
                 if not have_triggers:
                     yield self.rc.delete(word_with_prefix)
 
-        cleanup_words, cleanup_patterns = [], []
-        if existing is not None:
-            cleanup_words = yield remove_old_words_from_trigger(text_tokens, TRIGGER_SWORD_PREFIX)
-            cleanup_patterns = yield remove_old_words_from_trigger(pattern_tokens, TRIGGER_SWORD_PATTERN_PREFIX)
+        @defer.inlineCallbacks
+        def link_word_to_trigger(words, words_set_prefix, triggers_set_prefix):
+            for word in words:
+                yield t.sadd(triggers_set_prefix.format(trigger_id), word)
+                yield t.sadd(words_set_prefix.format(word), trigger_id)
 
-        link_word_to_trigger(text_tokens, SEARCH_WORD_PREFIX, TRIGGER_SWORD_PREFIX)
-        link_word_to_trigger(pattern_tokens, SEARCH_WORD_PATTERN_PREFIX, TRIGGER_SWORD_PATTERN_PREFIX)
+        old_text_tokens, old_pattern_tokens = get_tokens_for_trigger(existing) if existing else (None, None)
+        new_text_tokens, new_pattern_tokens = get_tokens_for_trigger(trigger)
 
-        yield pipeline.execute_pipeline()
+        if existing:
+            words_for_delete = set(old_text_tokens) - set(new_text_tokens)
+            patterns_for_delete = set(old_pattern_tokens) - set(new_pattern_tokens)
 
-        yield clean_words_without_triggers(cleanup_words, SEARCH_WORD_PREFIX)
-        yield clean_words_without_triggers(cleanup_patterns, SEARCH_WORD_PATTERN_PREFIX)
+            yield remove_old_words_from_trigger(words_for_delete, TRIGGER_SWORD_PREFIX)
+            yield remove_old_words_from_trigger(patterns_for_delete, TRIGGER_SWORD_PATTERN_PREFIX)
+
+            yield clean_words_without_triggers(words_for_delete, SEARCH_WORD_PREFIX)
+            yield clean_words_without_triggers(patterns_for_delete, SEARCH_WORD_PATTERN_PREFIX)
+
+        yield link_word_to_trigger(new_text_tokens, SEARCH_WORD_PREFIX, TRIGGER_SWORD_PREFIX)
+        yield link_word_to_trigger(new_pattern_tokens, SEARCH_WORD_PATTERN_PREFIX, TRIGGER_SWORD_PATTERN_PREFIX)
 
     @defer.inlineCallbacks
     @docstring_parameters(PATTERNS)
